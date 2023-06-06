@@ -1,3 +1,5 @@
+# Copyright (c) ONNX Project Contributors
+#
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=C0415,R0902,R0912,R0913,R0914,R0915
 from io import BytesIO
@@ -8,9 +10,8 @@ import numpy as np
 from onnx import load, numpy_helper
 from onnx.defs import onnx_opset_version
 from onnx.onnx_pb import FunctionProto, GraphProto, ModelProto, NodeProto, TypeProto
-from onnx.shape_inference import infer_shapes
-
-from .op_run import OpRun, RuntimeContextError
+from onnx.reference.op_run import OpRun, RuntimeContextError
+from onnx.reference.ops_optimized import optimized_operators
 
 
 class ReferenceEvaluator:
@@ -32,7 +33,18 @@ class ReferenceEvaluator:
     :param new_ops: this runtime can be used to test the implementations
         of new operators, *new_ops* is a list of classes
         derived from :class:`OpRun <onnx.reference.op_run.OpRun>`,
-        every class must define the static attribute `domain`
+        every class must define the static attribute `domain`,
+        there may be multiple implementations for the same operator,
+        the first one in the list is used.
+    :param optimized: some operators have two implementations,
+        a naive one corresponding to definition of the mathematical
+        definition of the operator, another one more efficient.
+        This is the case for operator Conv. The naive version is ten times
+        slower than the optimized one using a decomposition
+        into *Conv = im2col + Gemm*. If True, all optimized
+        kernels are added in `new_ops` and are used instead of the
+        inner implementation if list *new_ops* does not already contain
+        one.
 
     The class maps every node to its associated implementation.
     When a subgraph of a function is met,
@@ -126,6 +138,32 @@ class ReferenceEvaluator:
         x = np.array([[0, 1], [-1, 2]], dtype=np.float32)
         y = Celu.eval(x, alpha=0.5)
         print(y)
+
+    It is possible to overwrite an existing operator.
+    The class name must be the same. The domain does not have
+    to be specified for the default domain. However, by default,
+    class `OpRun` will load the most recent for this operator.
+    It can be explicirely specified by adding static attribute
+    `op_schema` of type :class:`OpSchema
+    <onnx.onnx_cpp2py_export.defs.OpSchema>`.
+
+    ::
+
+        from onnx.reference.op_run.op_conv import Conv as _Conv
+
+        class Conv(_Conv):
+
+            op_schema = instance_of_OpSchema()
+
+            def _run(self, ...):
+                ...
+
+        An operator may be different in a later opset. In that case,
+        a new implementation needs to be registered. `Pad_11`, `Pad_18`.
+        `Pad_11` is the implementation chose for opset in [11, 17].
+        `Pad_18` is selected for any greater opset. Both classes must be
+        imported into file `_op_list.py` to register their existence to the
+        runtime.
     """
 
     def __init__(  # type: ignore
@@ -135,7 +173,16 @@ class ReferenceEvaluator:
         functions: Optional[List[Union["ReferenceEvaluator", FunctionProto]]] = None,  # type: ignore
         verbose: int = 0,
         new_ops: Optional[List[OpRun]] = None,
+        optimized: bool = True,
     ):
+        if optimized:
+            if new_ops is None:
+                new_ops = optimized_operators.copy()
+            else:
+                set_new_ops = set(new_ops)
+                for op in optimized_operators:
+                    if op not in set_new_ops:
+                        new_ops.append(op)
         self.output_types_ = None
         self.input_types_ = None
         if isinstance(proto, str):
@@ -153,7 +200,7 @@ class ReferenceEvaluator:
                 raise ValueError("opsets must be None if proto is ModelProto.")
             if functions is not None:
                 raise ValueError("functions must be None if proto is ModelProto.")
-            functions = proto.functions
+            functions = proto.functions  # type: ignore[assignment]
         elif isinstance(proto, GraphProto):
             self.onnx_graph_ = proto
             if not isinstance(opsets, dict):
@@ -191,7 +238,7 @@ class ReferenceEvaluator:
             self.output_names_ = list(proto.output)
             self.inits_ = []
             if isinstance(proto, NodeProto):
-                self.nodes_ = [proto]
+                self.nodes_ = [proto]  # type: ignore[assignment]
             else:
                 self.nodes_ = proto.node
         if functions is not None:
@@ -211,18 +258,15 @@ class ReferenceEvaluator:
         if new_ops is not None:
             for cl in new_ops:
                 if not issubclass(cl, OpRun):  # type: ignore
-                    raise TypeError(
-                        f"Class {type(cl)} must inherit from OpRun (in new_ops)."
-                    )
+                    raise TypeError(f"Class {cl} must inherit from OpRun (in new_ops).")
                 if not hasattr(cl, "op_domain"):
                     raise AttributeError(
-                        f"Class {type(cl)} must define attribute 'op_domain'."
+                        f"Class {cl} must define attribute 'op_domain'."
                     )
                 key = cl.op_domain, cl.__name__  # type: ignore
                 if key in self.new_ops_:
-                    raise ValueError(
-                        f"Operator {cl.__name__!r} from domain {cl.op_domain!r} already exsits."  # type: ignore
-                    )
+                    # Already an implementation, the first one is used.
+                    continue
                 self.new_ops_[key] = cl
         self._init()
 
@@ -271,6 +315,14 @@ class ReferenceEvaluator:
         "Returns the opsets."
         return self.opsets_
 
+    @property
+    def has_linked_attribute(self):
+        """
+        Checks if the graph has a linked attribute (= an attribute whose value is defined
+        by a function attribute.
+        """
+        return any(node.has_linked_attribute for node in self.rt_nodes_)
+
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({', '.join(self.input_names)}) -> {', '.join(self.output_names)}"
 
@@ -281,7 +333,7 @@ class ReferenceEvaluator:
             )
         if name not in self.all_types_:
             raise RuntimeError(
-                f"Unable to return type for name {name!r}, it was not found in {list(sorted(self.all_types_))}."
+                f"Unable to return type for name {name!r}, it was not found in {sorted(self.all_types_)}."
             )
         return self.all_types_[name]
 
@@ -292,11 +344,12 @@ class ReferenceEvaluator:
         self.rt_inits_ = {}
         self.rt_nodes_ = []
         for init in self.inits_:
-            self.rt_inits_[init.name] = numpy_helper.to_array(init)
+            self.rt_inits_[init.name] = numpy_helper.to_array(init)  # type: ignore[union-attr,arg-type]
         run_params = {
             "log": lambda pattern, *args: self._log(10, pattern, *args),
             "opsets": self.opsets,
             "verbose": self.verbose,
+            "new_ops": self.new_ops_,
         }
         if self.input_types_:
             all_types = {i.name: i.type for i in self.onnx_graph_.input}
@@ -322,7 +375,13 @@ class ReferenceEvaluator:
                         f"If this node has a context dependent implementation, you should run function infer_shapes "
                         f"before calling ReferenceEvaluator."
                     ) from e
-            inst = cl(node, run_params)
+            try:
+                inst = cl(node, run_params)
+            except TypeError as e:
+                raise TypeError(
+                    f"Unable to instantiate class {cl!r} with "
+                    f"run_params={run_params} and node={node}."
+                ) from e
             self.rt_nodes_.append(inst)
 
     def _load_impl(
@@ -345,7 +404,7 @@ class ReferenceEvaluator:
             return self.new_ops_[key]
 
         if node.domain == "":
-            from .ops import load_op
+            from onnx.reference.ops import load_op
 
             try:
                 return load_op(node.domain, node.op_type, version)
@@ -357,28 +416,33 @@ class ReferenceEvaluator:
                     node.op_type,
                     version,
                     node=node,
-                    input_types=input_types,
+                    input_types=input_types,  # type: ignore[arg-type]
                 )
 
         if node.domain == "ai.onnx.preview.training":
-            from .ops.aionnx_preview_training import load_op as load_op_pt
+            from onnx.reference.ops.aionnx_preview_training import load_op as load_op_pt
 
             return load_op_pt(node.domain, node.op_type, version)
 
         if node.domain == "experimental":
-            from .ops.experimental import load_op as load_op_exp
+            from onnx.reference.ops.experimental import load_op as load_op_exp
 
             return load_op_exp(node.domain, node.op_type, version)
 
+        if node.domain == "ai.onnx.ml":
+            from onnx.reference.ops.aionnxml import load_op as load_op_ml
+
+            return load_op_ml(node.domain, node.op_type, version)
+
         # It has to be a function.
         if key in self.functions_:
-            from .ops import load_op
+            from onnx.reference.ops import load_op
 
             impl = self.functions_[key]
             return load_op(node.domain, node.op_type, version, custom=impl)
         raise NotImplementedError(
             f"Node type {node.op_type!r} from domain {node.domain!r} "
-            f"is unknown, known functions: {list(sorted(self.functions_))}."
+            f"is unknown, known functions: {sorted(self.functions_)}."
         )
 
     def run(self, output_names, feed_inputs: Dict[str, Any], attributes: Dict[str, Any] = None):  # type: ignore
@@ -398,12 +462,12 @@ class ReferenceEvaluator:
 
         # step 1: inputs and initializers
         results = {"": None}  # optional input
-        results.update(self.rt_inits_)
+        results.update(self.rt_inits_)  # type: ignore[arg-type]
         results.update(feed_inputs)
         for k, v in self.rt_inits_.items():
-            self._log(2, " +C %s: %s", k, v)
+            self._log(2, " +C %s: %s", k, v)  # type: ignore[arg-type]
         for k, v in feed_inputs.items():
-            self._log(2, " +I %s: %s", k, v)
+            self._log(2, " +I %s: %s", k, v)  # type: ignore[arg-type]
 
         # step 2: execute nodes
         for node in self.rt_nodes_:
@@ -421,7 +485,7 @@ class ReferenceEvaluator:
                     raise TypeError(
                         f"Unexected type {type(value)} for output {name!r}."
                     )
-                self._log(2, " + %s: %s", name, value)
+                self._log(2, " + %s: %s", name, value)  # type: ignore[arg-type]
                 results[name] = value
 
         # return the results
@@ -429,7 +493,7 @@ class ReferenceEvaluator:
         for name in output_names:
             if name not in results:
                 raise RuntimeError(
-                    f"Unable to find output name {name!r} in {list(sorted(results))}, proto is\n{self.proto_}"
+                    f"Unable to find output name {name!r} in {sorted(results)}, proto is\n{self.proto_}"
                 )
             list_results.append(results[name])
         return list_results

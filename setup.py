@@ -1,8 +1,11 @@
+# Copyright (c) ONNX Project Contributors
+#
 # SPDX-License-Identifier: Apache-2.0
 
 import glob
 import multiprocessing
 import os
+import pathlib
 import platform
 import shlex
 import subprocess
@@ -46,6 +49,9 @@ ONNX_VERIFY_PROTO3 = bool(os.getenv("ONNX_VERIFY_PROTO3") == "1")
 ONNX_NAMESPACE = os.getenv("ONNX_NAMESPACE", "onnx")
 ONNX_BUILD_TESTS = bool(os.getenv("ONNX_BUILD_TESTS") == "1")
 ONNX_DISABLE_EXCEPTIONS = bool(os.getenv("ONNX_DISABLE_EXCEPTIONS") == "1")
+ONNX_DISABLE_STATIC_REGISTRATION = bool(
+    os.getenv("ONNX_DISABLE_STATIC_REGISTRATION") == "1"
+)
 
 USE_MSVC_STATIC_RUNTIME = bool(os.getenv("USE_MSVC_STATIC_RUNTIME", "0") == "1")
 DEBUG = bool(os.getenv("DEBUG", "0") == "1")
@@ -113,7 +119,7 @@ class ONNXCommand(setuptools.Command):
         pass
 
 
-class create_version(ONNXCommand):
+class CreateVersion(ONNXCommand):
     def run(self):
         with open(os.path.join(SRC_DIR, "version.py"), "w") as f:
             f.write(
@@ -131,7 +137,7 @@ class create_version(ONNXCommand):
             )
 
 
-class cmake_build(setuptools.Command):
+class CmakeBuild(setuptools.Command):
     """
     Compiles everything when `python setup.py build` is run using cmake.
 
@@ -156,9 +162,9 @@ class cmake_build(setuptools.Command):
         self.jobs = multiprocessing.cpu_count() if self.jobs is None else int(self.jobs)
 
     def run(self):
-        if cmake_build.built:
+        if CmakeBuild.built:
             return
-        cmake_build.built = True
+        CmakeBuild.built = True
         if not os.path.exists(CMAKE_BUILD_DIR):
             os.makedirs(CMAKE_BUILD_DIR)
 
@@ -204,6 +210,8 @@ class cmake_build(setuptools.Command):
                 cmake_args.append("-DONNX_BUILD_TESTS=ON")
             if ONNX_DISABLE_EXCEPTIONS:
                 cmake_args.append("-DONNX_DISABLE_EXCEPTIONS=ON")
+            if ONNX_DISABLE_STATIC_REGISTRATION:
+                cmake_args.append("-DONNX_DISABLE_STATIC_REGISTRATION=ON")
             if "CMAKE_ARGS" in os.environ:
                 extra_cmake_args = shlex.split(os.environ["CMAKE_ARGS"])
                 # prevent crossfire with downstream scripts
@@ -216,6 +224,18 @@ class cmake_build(setuptools.Command):
                 raise RuntimeError(
                     "-DONNX_DISABLE_EXCEPTIONS=ON option is only available for c++ builds. Python binding require exceptions to be enabled."
                 )
+            if (
+                "PYTHONPATH" in os.environ
+                and "pip-build-env" in os.environ["PYTHONPATH"]
+            ):
+                # When the users use `pip install -e .` to install onnx and
+                # the cmake executable is a python entry script, there will be
+                # `Fix ModuleNotFoundError: No module named 'cmake'` from the cmake script.
+                # This is caused by the additional PYTHONPATH environment variable added by pip,
+                # which makes cmake python entry script not able to find correct python cmake packages.
+                # Actually, sys.path is well enough for `pip install -e .`.
+                # Therefore, we delete the PYTHONPATH variable.
+                del os.environ["PYTHONPATH"]
             subprocess.check_call(cmake_args)
 
             build_args = [CMAKE, "--build", os.curdir]
@@ -227,7 +247,7 @@ class cmake_build(setuptools.Command):
             subprocess.check_call(build_args)
 
 
-class build_py(setuptools.command.build_py.build_py):
+class BuildPy(setuptools.command.build_py.build_py):
     def run(self):
         self.run_command("create_version")
         self.run_command("cmake_build")
@@ -245,13 +265,13 @@ class build_py(setuptools.command.build_py.build_py):
         return setuptools.command.build_py.build_py.run(self)
 
 
-class develop(setuptools.command.develop.develop):
+class Develop(setuptools.command.develop.develop):
     def run(self):
         self.run_command("build_py")
         setuptools.command.develop.develop.run(self)
 
 
-class build_ext(setuptools.command.build_ext.build_ext):
+class BuildExt(setuptools.command.build_ext.build_ext):
     def run(self):
         self.run_command("cmake_build")
         setuptools.command.build_ext.build_ext.run(self)
@@ -274,27 +294,12 @@ class build_ext(setuptools.command.build_ext.build_ext):
             self.copy_file(src, dst)
 
 
-class mypy_type_check(ONNXCommand):
-    description = "Run MyPy type checker"
-
-    def run(self):
-        """Run command."""
-        onnx_script = os.path.realpath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "tools/mypy-onnx.py"
-            )
-        )
-        returncode = subprocess.call([sys.executable, onnx_script])
-        sys.exit(returncode)
-
-
-cmdclass = {
-    "create_version": create_version,
-    "cmake_build": cmake_build,
-    "build_py": build_py,
-    "develop": develop,
-    "build_ext": build_ext,
-    "typecheck": mypy_type_check,
+CMDCLASS = {
+    "create_version": CreateVersion,
+    "cmake_build": CmakeBuild,
+    "build_py": BuildPy,
+    "develop": Develop,
+    "build_ext": BuildExt,
 }
 
 ################################################################################
@@ -343,12 +348,8 @@ tests_require.append("nbval")
 tests_require.append("tabulate")
 
 extras_require["lint"] = [
-    "clang-format==13.0.0",
-    "flake8>=5.0.2",
-    "mypy>=0.971",
-    "types-protobuf==3.18.4",
-    "black>=22.3",
-    "isort[colors]>=5.10",
+    "lintrunner>=0.10.0",
+    "lintrunner-adapters>=0.3",
 ]
 
 ################################################################################
@@ -359,10 +360,10 @@ setuptools.setup(
     name=PACKAGE_NAME,
     version=VersionInfo.version,
     description="Open Neural Network Exchange",
-    long_description=open("README.md").read(),
+    long_description=pathlib.Path("README.md").read_text(),
     long_description_content_type="text/markdown",
     ext_modules=ext_modules,
-    cmdclass=cmdclass,
+    cmdclass=CMDCLASS,
     packages=packages,
     license="Apache License v2.0",
     include_package_data=True,

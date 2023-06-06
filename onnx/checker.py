@@ -1,28 +1,34 @@
+# Copyright (c) ONNX Project Contributors
+#
 # SPDX-License-Identifier: Apache-2.0
 """onnx checker
 
 This implements graphalities that allows us to check whether a serialized
 proto is legal.
 """
+from __future__ import annotations
 
 import functools
+import os
 import sys
-from typing import Any, Callable, Type, TypeVar, Union, cast
+from typing import Any, Callable, TypeVar, cast
 
 from google.protobuf.message import Message
 
 import onnx.defs
-import onnx.onnx_cpp2py_export.checker as C
+import onnx.onnx_cpp2py_export.checker as C  # noqa: N812
 import onnx.shape_inference
 from onnx import (
     IR_VERSION,
     AttributeProto,
+    FunctionProto,
     GraphProto,
     ModelProto,
     NodeProto,
     SparseTensorProto,
     TensorProto,
     ValueInfoProto,
+    helper,
 )
 
 # Limitation of single protobuf file is 2GB
@@ -44,15 +50,13 @@ FuncType = TypeVar("FuncType", bound=Callable[..., Any])
 
 
 # TODO: This really doesn't seem worth the metaprogramming...
-def _create_checker(proto_type: Type[Message]) -> Callable[[FuncType], FuncType]:
+def _create_checker(proto_type: type[Message]) -> Callable[[FuncType], FuncType]:
     def decorator(py_func: FuncType) -> FuncType:
         @functools.wraps(py_func)
         def checker(proto: Message, ctx: C.CheckerContext = DEFAULT_CONTEXT) -> Any:
             if not isinstance(proto, proto_type):
                 raise RuntimeError(
-                    "You cannot pass an object that is not of type {}".format(
-                        proto_type.__name__
-                    )
+                    f"You cannot pass an object that is not of type {proto_type.__name__}"
                 )
             return getattr(C, py_func.__name__)(proto.SerializeToString(), ctx)
 
@@ -85,6 +89,21 @@ def check_node(node: NodeProto, ctx: C.CheckerContext = DEFAULT_CONTEXT) -> None
     pass
 
 
+def check_function(
+    function: FunctionProto, ctx: C.CheckerContext | None = None
+) -> None:
+    if ctx is None:
+        ctx = C.CheckerContext()
+        ctx.ir_version = helper.find_min_ir_version_for(
+            list(function.opset_import), True
+        )
+        function_opset_dic = {}
+        for domain_version in function.opset_import:
+            function_opset_dic[domain_version.domain] = domain_version.version
+        ctx.opset_imports = function_opset_dic
+    C.check_function(function.SerializeToString(), ctx)
+
+
 @_create_checker(GraphProto)
 def check_graph(graph: GraphProto, ctx: C.CheckerContext = DEFAULT_CONTEXT) -> None:
     pass
@@ -96,16 +115,20 @@ def check_sparse_tensor(
     C.check_sparse_tensor(sparse.SerializeToString(), ctx)
 
 
-def check_model(model: Union[ModelProto, str, bytes], full_check: bool = False) -> None:
+def check_model(
+    model: ModelProto | str | bytes | os.PathLike,
+    full_check: bool = False,
+    skip_opset_compatibility_check: bool = False,
+) -> None:
     """Check the consistency of a model. An exception is raised if the test fails.
 
     Arguments:
-        model (ModelProto): model to check
+        model (ModelProto | str | bytes | os.PathLike): model to check
         full_check (bool): if True, the function checks shapes can be inferred
     """
     # If model is a path instead of ModelProto
-    if isinstance(model, str):
-        C.check_model_path(model, full_check)
+    if isinstance(model, (str, os.PathLike)):
+        C.check_model_path(os.fspath(model), full_check, skip_opset_compatibility_check)
     else:
         protobuf_string = (
             model if isinstance(model, bytes) else model.SerializeToString()
@@ -116,7 +139,7 @@ def check_model(model: Union[ModelProto, str, bytes], full_check: bool = False) 
             raise ValueError(
                 "This protobuf of onnx model is too large (>2GB). Call check_model with model path instead."
             )
-        C.check_model(protobuf_string, full_check)
+        C.check_model(protobuf_string, full_check, skip_opset_compatibility_check)
 
 
 ValidationError = C.ValidationError
